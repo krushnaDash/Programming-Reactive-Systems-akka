@@ -43,6 +43,9 @@ object Transactor {
     * @param sessionTimeout Delay before rolling back the pending modifications and
     *                       terminating the session
     *
+    * Note: To implement the timeout you have to use `ctx.scheduleOnce` instead of `Behaviors.withTimers`, due
+    *       to a current limitation of Akka: https://github.com/akka/akka/issues/24686
+    *
     * Hints:
     *   - When a [[Begin]] message is received, an anonymous child actor handling the session should be spawned,
     *   - In case the child actor is terminated, the session should be rolled back,
@@ -50,19 +53,17 @@ object Transactor {
     *   - After a session is started, the next behavior should be [[inSession]],
     *   - Messages other than [[Begin]] should not change the behavior.
     */
-  private def idle[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] = {
-    Behaviors receivePartial {
+  private def idle[T](value: T, sessionTimeout: FiniteDuration): Behavior[PrivateCommand[T]] =
+    Behaviors.receive {
       case (ctx, Begin(replyTo)) =>
-        val session = ctx.spawnAnonymous(sessionHandler(value, ctx.self, Set.empty))
-        val next = inSession(value, sessionTimeout, session)
-        ctx.watchWith(session, RolledBack(session))
-        ctx.setReceiveTimeout(sessionTimeout, RolledBack(session))
-        replyTo ! session
-        next
-      case (_, Committed(_, _)) => Behaviors.ignore
-      case (_, RolledBack(_)) => Behaviors.ignore
+        val sessionRef = ctx.spawnAnonymous(sessionHandler(value, ctx.self, Set.empty))
+        val rollbackValue = RolledBack(sessionRef)
+        ctx.watchWith(sessionRef, rollbackValue)
+        replyTo ! sessionRef
+        ctx.scheduleOnce(sessionTimeout, ctx.self, rollbackValue)
+        inSession(value, sessionTimeout, sessionRef)
+      case _ => Behaviors.same
     }
-  }
 
   /**
     * @return A behavior that defines how to react to [[PrivateCommand]] messages when the transactor has
@@ -74,15 +75,18 @@ object Transactor {
     * @param sessionTimeout Timeout to use for the next session
     * @param sessionRef Reference to the child [[Session]] actor
     */
-  private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] = {
-    Behaviors receivePartial {
-      case (_, Committed(session, value)) if session == sessionRef =>
+  private def inSession[T](rollbackValue: T, sessionTimeout: FiniteDuration, sessionRef: ActorRef[Session[T]]): Behavior[PrivateCommand[T]] =
+    Behaviors.receivePartial {
+      case (_, Committed(current, value)) if current == sessionRef =>
         idle(value, sessionTimeout)
-      case (ctx, RolledBack(session)) if session == sessionRef =>
-        ctx stop session
+      case (_, Committed(_, _)) =>
+        Behaviors.same
+      case (ctx, RolledBack(current)) if current == sessionRef  =>
+        ctx stop sessionRef
         idle(rollbackValue, sessionTimeout)
+      case (_, RolledBack(_)) =>
+        Behaviors.same
     }
-  }
 
   /**
     * @return A behavior handling [[Session]] messages. See in the instructions
@@ -92,23 +96,23 @@ object Transactor {
     * @param commit Parent actor reference, to send the [[Committed]] message to
     * @param done Set of already applied [[Modify]] messages
     */
-  private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long]): Behavior[Session[T]] = {
-    Behaviors receive {
-      case (ctx, Commit(reply, replyTo)) =>
-        commit ! Committed(ctx.self, currentValue)
-        replyTo ! reply
-        Behaviors.stopped
-      case (_, Rollback()) =>
-        Behaviors.stopped
+  private def sessionHandler[T](currentValue: T, commit: ActorRef[Committed[T]], done: Set[Long]): Behavior[Session[T]] =
+    Behaviors.receive {
       case (_, Extract(f, replyTo)) =>
         replyTo ! f(currentValue)
         Behaviors.same
-      case (_, Modify(f, id, reply, replyTo)) if done.isEmpty || id > done.max =>
-        replyTo ! reply
-        sessionHandler(f(currentValue), commit, done + id)
-      case (_, Modify(_, id, reply, replyTo)) if id <= done.max =>
+      case (_, Modify(_, id, reply, replyTo)) if done contains id =>
         replyTo ! reply
         Behaviors.same
+      case (_, Modify(f, id, reply, replyTo)) =>
+        replyTo ! reply
+        sessionHandler(f(currentValue), commit, done + id)
+      case (ctx, Commit(reply, replyTo)) =>
+        replyTo ! reply
+        commit ! Committed(ctx.self, currentValue)
+        Behaviors.stopped
+      case (_, Rollback()) =>
+        Behaviors.stopped
     }
-  }
+
 }
